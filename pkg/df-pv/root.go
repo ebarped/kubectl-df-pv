@@ -30,18 +30,18 @@ import (
 
 // IEC (binary) byte size constants for readability
 const (
-    kibibyte int64 = 1 << 10
-    mebibyte int64 = 1 << 20
-    gibibyte int64 = 1 << 30
-    tebibyte int64 = 1 << 40
+	kibibyte int64 = 1 << 10
+	mebibyte int64 = 1 << 20
+	gibibyte int64 = 1 << 30
+	tebibyte int64 = 1 << 40
 )
 
 // Decimal (SI) byte size constants for readability
 const (
-    kilobyte int64 = 1000
-    megabyte int64 = 1000 * kilobyte
-    gigabyte int64 = 1000 * megabyte
-    terabyte int64 = 1000 * gigabyte
+	kilobyte int64 = 1000
+	megabyte int64 = 1000 * kilobyte
+	gigabyte int64 = 1000 * megabyte
+	terabyte int64 = 1000 * gigabyte
 )
 
 // InitAndExecute sets up and executes the cobra root command
@@ -57,6 +57,7 @@ type flagpole struct {
 	logLevel              string
 	genericCliConfigFlags *genericclioptions.ConfigFlags
 	disableColor          bool
+	columns               string
 }
 
 func setupRootCommand() *cobra.Command {
@@ -87,6 +88,7 @@ It colors the values based on "severity" [red: > 75% (too high); yellow: < 25% (
 
 	rootCmd.PersistentFlags().StringVarP(&flags.logLevel, "verbosity", "v", "info", "log level; one of [info, debug, trace, warn, error, fatal, panic]")
 	rootCmd.Flags().BoolVarP(&flags.disableColor, "disable-color", "d", false, "boolean flag for disabling colored output")
+	rootCmd.Flags().StringVar(&flags.columns, "columns", "", "comma separated list of columns to show")
 
 	flags.genericCliConfigFlags = genericclioptions.NewConfigFlags(false)
 	flags.genericCliConfigFlags.AddFlags(rootCmd.Flags())
@@ -114,49 +116,148 @@ func runRootCommand(flags *flagpole) error {
 		}
 		log.Infof("Either no volumes found in namespace/s: '%s' or the storage provisioner used for the volumes does not publish metrics to kubelet", ns)
 	} else {
-		PrintUsingGoPretty(sliceOfOutputRowPVC, flags.disableColor)
+		PrintUsingGoPretty(sliceOfOutputRowPVC, flags.disableColor, flags.columns)
 	}
 
 	return nil
 }
 
+type columnDef struct {
+	header string
+	value  func(row *OutputRowPVC) interface{}
+	color  func(row *OutputRowPVC) text.Color
+	format string
+}
+
 // PrintUsingGoPretty prints a slice of output rows
-func PrintUsingGoPretty(sliceOfOutputRowPVC []*OutputRowPVC, disableColor bool) {
+func PrintUsingGoPretty(sliceOfOutputRowPVC []*OutputRowPVC, disableColor bool, columns string) {
 	if disableColor {
 		text.DisableColors()
 	}
 	// https://github.com/jedib0t/go-pretty/tree/v6.0.4/table
 	t := table.NewWriter()
 
-	t.AppendHeader(table.Row{"PV Name", "PVC Name", "Namespace", "Node Name", "Pod Name", "Volume Mount Name", "Size", "Used", "Available", "%Used", "iused", "ifree", "%iused"})
-	var whiteColor = text.FgWhite
-	var percentageUsedColor text.Color
-	var percentageIUsedColor text.Color
+	allColumns := map[string]columnDef{
+		"pv": {
+			header: "PV Name",
+			value:  func(row *OutputRowPVC) interface{} { return row.PVName },
+			format: "%s",
+		},
+		"pvc": {
+			header: "PVC Name",
+			value:  func(row *OutputRowPVC) interface{} { return row.PVCName },
+			format: "%s",
+		},
+		"namespace": {
+			header: "Namespace",
+			value:  func(row *OutputRowPVC) interface{} { return row.Namespace },
+			format: "%s",
+		},
+		"node": {
+			header: "Node Name",
+			value:  func(row *OutputRowPVC) interface{} { return row.NodeName },
+			format: "%s",
+		},
+		"pod": {
+			header: "Pod Name",
+			value:  func(row *OutputRowPVC) interface{} { return row.PodName },
+			format: "%s",
+		},
+		"mount": {
+			header: "Volume Mount Name",
+			value:  func(row *OutputRowPVC) interface{} { return row.VolumeMountName },
+			format: "%s",
+		},
+		"size": {
+			header: "Size",
+			value: func(row *OutputRowPVC) interface{} {
+				return ConvertQuantityValueToHumanReadableIECString(row.CapacityBytes)
+			},
+			color:  func(row *OutputRowPVC) text.Color { return GetColorFromPercentageUsed(row.PercentageUsed) },
+			format: "%s",
+		},
+		"used": {
+			header: "Used",
+			value: func(row *OutputRowPVC) interface{} {
+				return ConvertQuantityValueToHumanReadableIECString(row.UsedBytes)
+			},
+			color:  func(row *OutputRowPVC) text.Color { return GetColorFromPercentageUsed(row.PercentageUsed) },
+			format: "%s",
+		},
+		"available": {
+			header: "Available",
+			value: func(row *OutputRowPVC) interface{} {
+				return ConvertQuantityValueToHumanReadableIECString(row.AvailableBytes)
+			},
+			color:  func(row *OutputRowPVC) text.Color { return GetColorFromPercentageUsed(row.PercentageUsed) },
+			format: "%s",
+		},
+		"%used": {
+			header: "%Used",
+			value:  func(row *OutputRowPVC) interface{} { return row.PercentageUsed },
+			color:  func(row *OutputRowPVC) text.Color { return GetColorFromPercentageUsed(row.PercentageUsed) },
+			format: "%.2f",
+		},
+		"iused": {
+			header: "iused",
+			value:  func(row *OutputRowPVC) interface{} { return row.InodesUsed },
+			color:  func(row *OutputRowPVC) text.Color { return GetColorFromPercentageUsed(row.PercentageIUsed) },
+			format: "%d",
+		},
+		"ifree": {
+			header: "ifree",
+			value:  func(row *OutputRowPVC) interface{} { return row.InodesFree },
+			color:  func(row *OutputRowPVC) text.Color { return GetColorFromPercentageUsed(row.PercentageIUsed) },
+			format: "%d",
+		},
+		"%iused": {
+			header: "%iused",
+			value:  func(row *OutputRowPVC) interface{} { return row.PercentageIUsed },
+			color:  func(row *OutputRowPVC) text.Color { return GetColorFromPercentageUsed(row.PercentageIUsed) },
+			format: "%.2f",
+		},
+	}
+
+	defaultOrder := []string{"pv", "pvc", "namespace", "node", "pod", "mount", "size", "used", "available", "%used", "iused", "ifree", "%iused"}
+	var selectedColumns []string
+
+	if columns == "" {
+		selectedColumns = defaultOrder
+	} else {
+		selectedColumns = strings.Split(columns, ",")
+	}
+
+	var headerRow table.Row
+	for _, colName := range selectedColumns {
+		colName = strings.TrimSpace(strings.ToLower(colName))
+		if def, ok := allColumns[colName]; ok {
+			headerRow = append(headerRow, def.header)
+		}
+	}
+	t.AppendHeader(headerRow)
+
 	for _, pvcRow := range sliceOfOutputRowPVC {
-		percentageUsedColor = GetColorFromPercentageUsed(pvcRow.PercentageUsed)
-		percentageIUsedColor = GetColorFromPercentageUsed(pvcRow.PercentageIUsed)
-		t.AppendRow([]interface{}{
-			fmt.Sprintf("%s", pvcRow.PVName),
-			fmt.Sprintf("%s", pvcRow.PVCName),
-			fmt.Sprintf("%s", pvcRow.Namespace),
-			fmt.Sprintf("%s", pvcRow.NodeName),
-			fmt.Sprintf("%s", pvcRow.PodName),
-			fmt.Sprintf("%s", pvcRow.VolumeMountName),
-			percentageUsedColor.Sprintf("%s", ConvertQuantityValueToHumanReadableIECString(pvcRow.CapacityBytes)),
-			percentageUsedColor.Sprintf("%s", ConvertQuantityValueToHumanReadableIECString(pvcRow.UsedBytes)),
-			percentageUsedColor.Sprintf("%s", ConvertQuantityValueToHumanReadableIECString(pvcRow.AvailableBytes)),
-			percentageUsedColor.Sprintf("%.2f", pvcRow.PercentageUsed),
-			percentageIUsedColor.Sprintf("%d", pvcRow.InodesUsed),
-			percentageIUsedColor.Sprintf("%d", pvcRow.InodesFree),
-			percentageIUsedColor.Sprintf("%.2f", pvcRow.PercentageIUsed),
-		})
+		var row []interface{}
+		for _, colName := range selectedColumns {
+			colName = strings.TrimSpace(strings.ToLower(colName))
+			if def, ok := allColumns[colName]; ok {
+				val := def.value(pvcRow)
+				if def.color != nil {
+					c := def.color(pvcRow)
+					row = append(row, c.Sprintf(def.format, val))
+				} else {
+					row = append(row, fmt.Sprintf(def.format, val))
+				}
+			}
+		}
+		t.AppendRow(row)
 	}
 
 	// https://github.com/jedib0t/go-pretty/blob/v6.0.4/table/style.go
 	styleBold := table.StyleBold
 	styleBold.Options = table.OptionsNoBordersAndSeparators
 	t.SetStyle(styleBold)
-	t.Style().Color.Header = text.Colors{whiteColor, text.Bold}
+	t.Style().Color.Header = text.Colors{text.FgWhite, text.Bold}
 	// t.Style().Options.SeparateRows = true
 	// t.SetAutoIndex(true)
 	// t.SetOutputMirror(os.Stdout)
@@ -177,56 +278,56 @@ func GetColorFromPercentageUsed(percentageUsed float64) text.Color {
 // ConvertQuantityValueToHumanReadableIECString converts value to human readable IEC format
 // https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
 func ConvertQuantityValueToHumanReadableIECString(quantity *resource.Quantity) string {
-    bytes := quantity.Value()
-    if bytes < 0 {
-        bytes = 0
-    }
+	bytes := quantity.Value()
+	if bytes < 0 {
+		bytes = 0
+	}
 
-    var val float64
-    var suffix string
+	var val float64
+	var suffix string
 
-    switch {
-    case bytes >= tebibyte:
-        val = float64(bytes) / float64(tebibyte)
-        suffix = "Ti"
-    case bytes >= gibibyte:
-        val = float64(bytes) / float64(gibibyte)
-        suffix = "Gi"
-    case bytes >= mebibyte:
-        val = float64(bytes) / float64(mebibyte)
-        suffix = "Mi"
-    case bytes >= kibibyte:
-        val = float64(bytes) / float64(kibibyte)
-        suffix = "Ki"
-    default:
-        return fmt.Sprintf("%d", bytes)
-    }
+	switch {
+	case bytes >= tebibyte:
+		val = float64(bytes) / float64(tebibyte)
+		suffix = "Ti"
+	case bytes >= gibibyte:
+		val = float64(bytes) / float64(gibibyte)
+		suffix = "Gi"
+	case bytes >= mebibyte:
+		val = float64(bytes) / float64(mebibyte)
+		suffix = "Mi"
+	case bytes >= kibibyte:
+		val = float64(bytes) / float64(kibibyte)
+		suffix = "Ki"
+	default:
+		return fmt.Sprintf("%d", bytes)
+	}
 
-    // strip trailing zeroes, then strip decimal if not needed
-    strVal := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", val), "0"), ".")
-    return fmt.Sprintf("%s%s", strVal, suffix)
+	// strip trailing zeroes, then strip decimal if not needed
+	strVal := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", val), "0"), ".")
+	return fmt.Sprintf("%s%s", strVal, suffix)
 }
 
 // ConvertQuantityValueToHumanReadableDecimalString converts value to human readable decimal format
 func ConvertQuantityValueToHumanReadableDecimalString(quantity *resource.Quantity) string {
-    val := quantity.Value()
+	val := quantity.Value()
 
-    TBConvertedVal := val / terabyte
-    GBConvertedVal := val / gigabyte
-    MBConvertedVal := val / megabyte
-    KBConvertedVal := val / kilobyte
+	TBConvertedVal := val / terabyte
+	GBConvertedVal := val / gigabyte
+	MBConvertedVal := val / megabyte
+	KBConvertedVal := val / kilobyte
 
-    if TBConvertedVal > 1 {
-        return fmt.Sprintf("%d%s", TBConvertedVal, "TB")
-    } else if GBConvertedVal > 1 {
-        return fmt.Sprintf("%d%s", GBConvertedVal, "GB")
-    } else if MBConvertedVal > 1 {
-        return fmt.Sprintf("%d%s", MBConvertedVal, "MB")
-    } else if KBConvertedVal > 1 {
-        return fmt.Sprintf("%d%s", KBConvertedVal, "KB")
-    } else {
-        return fmt.Sprintf("%d", val)
-    }
+	if TBConvertedVal > 1 {
+		return fmt.Sprintf("%d%s", TBConvertedVal, "TB")
+	} else if GBConvertedVal > 1 {
+		return fmt.Sprintf("%d%s", GBConvertedVal, "GB")
+	} else if MBConvertedVal > 1 {
+		return fmt.Sprintf("%d%s", MBConvertedVal, "MB")
+	} else if KBConvertedVal > 1 {
+		return fmt.Sprintf("%d%s", KBConvertedVal, "KB")
+	} else {
+		return fmt.Sprintf("%d", val)
+	}
 }
 
 // OutputRowPVC represents the output row
